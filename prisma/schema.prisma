@@ -1,0 +1,96 @@
+datasource db {
+  provider   = "postgresql"
+  extensions = [pg_trgm]
+}
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+model Account {
+  id           String   @id
+  nickname     String
+  role         String
+  mobileNumber String   @map("mobilenumber")
+  ucc          String
+  mpin         String
+  consumerKey  String   @map("consumerkey")
+  totpSecret   String?  @map("totpsecret")
+  multiplier   Float    @default(1.0)
+  status       String   @default("disconnected")
+  lastLogin    String?  @map("lastlogin")
+  accessToken  String?  @map("accesstoken")
+  sid          String?
+  neoToken     String?  @map("neotoken")
+  rid          String?
+  hsServerId   String?  @map("hsserverid")
+  dataCenter   String?  @map("datacenter")
+  baseUrl      String?  @map("baseurl")
+  errorMessage String?  @map("errormessage")
+  createdAt    String   @map("createdat")
+
+  orders       Order[]
+  @@map("accounts")
+}
+
+model Order {
+  id              String   @id
+  masterOrderId   String?  @map("masterorderid")
+  accountId       String   @map("accountid")
+  accountName     String   @map("accountname")
+  accountRole     String   @map("accountrole")
+  symbol          String
+  instrument      String
+  optionType      String   @map("optiontype")
+  strikePrice     Float    @map("strikeprice")
+  expiry          String
+  quantity        Int
+  price           Float
+  orderType       String   @map("ordertype")
+  transactionType String   @map("transactiontype")
+  status          String
+  errorMessage    String?  @map("errormessage")
+  timestamp       String
+  isSimulated     Boolean  @map("issimulated")
+
+  account         Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  @@map("orders")
+}
+
+model Watchlist {
+  scriptToken    String   @id @map("scripttoken")
+  tradingSymbol  String   @map("tradingsymbol")
+  exchange       String
+  instrumentName String   @map("instrumentname")
+  segment        String
+  strikePrice    Float    @map("strikeprice")
+  expiry         String
+  lotSize        Int      @map("lotsize")
+  addedAt        String   @map("addedat")
+
+  @@map("watchlist")
+}
+
+model Settings {
+  id                Int     @id @default(1)
+  autoReplicate     Boolean @default(true) @map("autoreplicate")
+  autoRenewSessions Boolean @default(true) @map("autorenewsessions")
+
+  @@map("settings")
+}
+
+model Scrip {
+  scriptToken    String  @id @map("scripttoken")
+  tradingSymbol  String  @map("tradingsymbol")
+  scripRefKey    String  @map("scriprefkey")
+  instrumentName String  @map("instrumentname")
+  exchange       String
+  segment        String
+  strikePrice    Float    @map("strikeprice")
+  expiry         String?
+  lotSize        Int      @map("lotsize")
+
+  @@index([tradingSymbol(ops: raw("gin_trgm_ops")), instrumentName(ops: raw("gin_trgm_ops"))], name: "idx_scrips_trgm", type: Gin)
+  @@map("scrips")
+}

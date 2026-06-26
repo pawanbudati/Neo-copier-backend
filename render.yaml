@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: neo-copier-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: DATABASE_URL
+        sync: false # Set this to your live Supabase connection string in the Render Dashboard
+      - key: NODE_ENV
+        value: production
