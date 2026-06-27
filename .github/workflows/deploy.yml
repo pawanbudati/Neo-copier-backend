@@ -1,0 +1,34 @@
+name: Deploy Backend to GCP VM
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Execute Deploy Commands via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.GCP_VM_HOST }}
+          username: ${{ secrets.GCP_VM_USERNAME }}
+          key: ${{ secrets.GCP_VM_SSH_KEY }}
+          port: 22
+          script: |
+            # Navigate to backend directory
+            cd ~/Neo-copier-backend
+            
+            # Fetch latest changes
+            git pull origin main
+            
+            # Install dependencies and build
+            npm install
+            npm run build
+            
+            # Restart backend process in PM2
+            pm2 restart neo-copier-backend || pm2 start dist/server.cjs --name "neo-copier-backend"
