@@ -5,8 +5,8 @@ import cors from "cors";
 import path from "path";
 import fs from "fs";
 import os from "os";
-import { getAccounts, saveAccount, deleteAccount, getOrders, saveOrder, getSettings, updateSettings, KotakAccount, WatchlistItem, initializeDbForCloud } from "./server/db";
-import { authenticateKotakAccount, replicateMasterTrade, searchScrips, loadScripMasterCache, isScripMasterLoaded, getScripMasterCount, ScripInfo, subscribeTokens, unsubscribeTokens, onPriceTick, getLastPrices, isMarketFeedConnected, connectMarketFeed, QuoteTick, getNeoAccountPositions, getNeoAccountLimits, executeNeoOrder, initializeScripStatusFromDb } from "./server/neo_api";
+import { getAccounts, saveAccount, deleteAccount, getOrders, saveOrder, updateOrderStatus, getSettings, updateSettings, KotakAccount, WatchlistItem, initializeDbForCloud } from "./server/db";
+import { authenticateKotakAccount, replicateMasterTrade, searchScrips, loadScripMasterCache, isScripMasterLoaded, getScripMasterCount, ScripInfo, subscribeTokens, unsubscribeTokens, onPriceTick, getLastPrices, isMarketFeedConnected, connectMarketFeed, QuoteTick, getNeoAccountPositions, getNeoAccountLimits, executeNeoOrder, cancelNeoOrder, getOrderLiveStatus, initializeScripStatusFromDb } from "./server/neo_api";
 import { generateTOTP } from "./server/totp";
 
 function hasAutoTotpSecret(secret?: string): boolean {
@@ -289,10 +289,92 @@ async function startServer() {
       });
 
       res.json({
-        success: result.masterOrder.status === "SUCCESS",
+        success: result.masterOrder.status === "SUCCESS" || result.masterOrder.status === "PENDING",
         masterOrder: result.masterOrder,
         slaveOrders: result.slaveOrders,
       });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Cancel a pending order
+  app.post("/api/orders/:orderId/cancel", async (req, res) => {
+    try {
+      const { orderId } = req.params;
+      const allOrders = await getOrders();
+      const order = allOrders.find((o) => o.id === orderId);
+      if (!order) {
+        return res.status(404).json({ error: "Order not found" });
+      }
+      if (order.status !== "PENDING") {
+        return res.status(400).json({ error: `Cannot cancel order with status: ${order.status}` });
+      }
+
+      const accounts = await getAccounts();
+      const acc = accounts.find((a) => a.id === order.accountId);
+      if (!acc) {
+        return res.status(404).json({ error: "Account not found for this order" });
+      }
+
+      const result = await cancelNeoOrder(acc, orderId);
+      if (!result.success) {
+        return res.status(500).json({ error: result.error || "Failed to cancel order" });
+      }
+
+      await updateOrderStatus(orderId, "CANCELLED", "Cancelled by user");
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Sync status of all PENDING orders from broker order book
+  app.post("/api/orders/sync-status", async (req, res) => {
+    try {
+      const allOrders = await getOrders();
+      const pendingOrders = allOrders.filter((o) => o.status === "PENDING");
+
+      if (pendingOrders.length === 0) {
+        return res.json({ updated: 0, orders: allOrders });
+      }
+
+      const accounts = await getAccounts();
+      let updatedCount = 0;
+
+      // Group pending orders by accountId to minimize API calls
+      const ordersByAccount: Record<string, typeof pendingOrders> = {};
+      for (const order of pendingOrders) {
+        if (!ordersByAccount[order.accountId]) {
+          ordersByAccount[order.accountId] = [];
+        }
+        ordersByAccount[order.accountId].push(order);
+      }
+
+      for (const [accountId, accountOrders] of Object.entries(ordersByAccount)) {
+        const acc = accounts.find((a) => a.id === accountId);
+        if (!acc || acc.status !== "active") continue;
+
+        for (const order of accountOrders) {
+          const liveStatus = await getOrderLiveStatus(acc, order.id);
+          if (liveStatus && liveStatus.status !== "PENDING") {
+            const errorMsg = liveStatus.status === "FAILED"
+              ? (liveStatus.rejReason || "Rejected by exchange")
+              : liveStatus.status === "CANCELLED"
+                ? (liveStatus.cancelReason || "Cancelled")
+                : null;
+            await updateOrderStatus(
+              order.id,
+              liveStatus.status as any,
+              errorMsg
+            );
+            updatedCount++;
+          }
+        }
+      }
+
+      const updatedOrders = await getOrders();
+      res.json({ updated: updatedCount, orders: updatedOrders });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

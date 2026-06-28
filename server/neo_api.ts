@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { KotakAccount, TradeOrder, saveAccount, saveOrder, getAccounts, getSettings, prisma } from "./db";
+import { KotakAccount, TradeOrder, saveAccount, saveOrder, updateOrderStatus, getAccounts, getSettings, prisma } from "./db";
 import { generateTOTP } from "./totp";
 
 // ─── Kotak Neo API v2 Endpoints ─────────────────────────────────────────────
@@ -1050,6 +1050,91 @@ export async function pollOrderFinalStatus(
   return { success: true, status: "SUCCESS" }; // Fallback if order not found in book
 }
 
+// ─── Cancel an open order on the exchange ───────────────────────────────────
+export async function cancelNeoOrder(
+  account: KotakAccount,
+  orderId: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    if (!account.consumerKey || !account.neoToken || !account.sid) {
+      throw new Error("Account session expired or unauthenticated. Please login again.");
+    }
+
+    const baseUrl = account.baseUrl || NEO_API_BASE;
+    const cancelUrl = `${baseUrl}/quick/order/cancel`;
+
+    const payload = { on: String(orderId) };
+
+    console.log(`[CancelOrder] Cancelling order ${orderId} for ${account.nickname}...`);
+    console.log(`[CancelOrder] URL: ${cancelUrl}, Payload:`, JSON.stringify(payload));
+
+    const response = await fetch(cancelUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": account.neoToken,
+        "Sid": account.sid,
+        "Neo-Fin-Key": NEO_FIN_KEY,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+      },
+      body: `jData=${encodeURIComponent(JSON.stringify(payload))}`,
+    });
+
+    const resText = await response.text();
+    console.log(`[CancelOrder] Response (${response.status}):`, resText.slice(0, 500));
+
+    if (!response.ok) {
+      throw new Error(`Cancel failed (${response.status}): ${resText || response.statusText}`);
+    }
+
+    let resData: any;
+    try {
+      resData = JSON.parse(resText);
+    } catch (_) {
+      throw new Error(`Cancel response not JSON: ${resText.slice(0, 200)}`);
+    }
+
+    if (resData.stat === "NotOk" || resData.stat === "Not_Ok" || resData.errMsg || resData.error) {
+      throw new Error(`Cancel rejected: ${resData.errMsg || resData.error || resData.message || JSON.stringify(resData)}`);
+    }
+
+    return { success: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[CancelOrder] Error for ${account.nickname}:`, msg);
+    return { success: false, error: msg };
+  }
+}
+
+// ─── Get live status of a specific order from the broker order book ──────────
+export async function getOrderLiveStatus(
+  account: KotakAccount,
+  orderId: string
+): Promise<{ status: string; rejReason?: string; cancelReason?: string } | null> {
+  try {
+    const orders = await getNeoOrderBook(account);
+    const matched = orders.find((o: any) => String(o.nOrdNo) === String(orderId));
+    if (!matched) return null;
+
+    const ordSt = matched.ordSt ? matched.ordSt.toUpperCase() : "";
+
+    if (ordSt === "TRADED" || ordSt === "COMPLETE" || ordSt === "FILLED") {
+      return { status: "SUCCESS" };
+    } else if (ordSt === "REJECTED") {
+      return { status: "FAILED", rejReason: matched.rejReason };
+    } else if (ordSt === "CANCELLED" || ordSt === "CANCEL") {
+      return { status: "CANCELLED", cancelReason: matched.cancelReason };
+    } else if (ordSt === "OPEN" || ordSt === "PENDING" || ordSt.includes("TRIGGER")) {
+      return { status: "PENDING" };
+    }
+
+    return { status: ordSt || "UNKNOWN" };
+  } catch (e) {
+    console.error(`[OrderSync] Error checking order status for ${account.nickname}:`, e);
+    return null;
+  }
+}
+
 export async function getNeoAccountPositions(account: KotakAccount): Promise<any[]> {
   const baseUrl = account.baseUrl || NEO_API_BASE;
   const url = `${baseUrl}/quick/user/positions`;
@@ -1126,7 +1211,7 @@ export async function getNeoAccountLimits(account: KotakAccount): Promise<any> {
 export async function executeNeoOrder(
   account: KotakAccount,
   order: Omit<TradeOrder, "id" | "status" | "errorMessage" | "timestamp" | "accountId" | "accountName" | "accountRole" | "isSimulated" | "masterOrderId">,
-): Promise<{ success: boolean; orderId?: string; error?: string }> {
+): Promise<{ success: boolean; orderId?: string; status?: "SUCCESS" | "PENDING"; error?: string }> {
   const orderId = `NEO_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 
   try {
@@ -1238,7 +1323,11 @@ export async function executeNeoOrder(
       throw new Error(finalResult.error || "Order rejected by exchange");
     }
 
-    return { success: true, orderId: String(liveOrderId) };
+    return {
+      success: true,
+      orderId: String(liveOrderId),
+      status: finalResult.status as "SUCCESS" | "PENDING",
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[Order] Error for ${account.nickname}:`, msg);
@@ -1264,7 +1353,9 @@ export async function replicateMasterTrade(
     accountName: masterAcc.nickname,
     accountRole: "master",
     ...masterOrderInput,
-    status: masterResult.success ? "SUCCESS" : "FAILED",
+    status: masterResult.success
+      ? (masterResult.status === "PENDING" ? "PENDING" : "SUCCESS")
+      : "FAILED",
     errorMessage: masterResult.error || null,
     timestamp: new Date().toISOString(),
     isSimulated: false,
@@ -1295,7 +1386,9 @@ export async function replicateMasterTrade(
         accountName: slave.nickname,
         accountRole: "slave",
         ...slaveOrderInput,
-        status: slaveResult.success ? "SUCCESS" : "FAILED",
+        status: slaveResult.success
+          ? (slaveResult.status === "PENDING" ? "PENDING" : "SUCCESS")
+          : "FAILED",
         errorMessage: slaveResult.error || null,
         timestamp: new Date().toISOString(),
         isSimulated: false,

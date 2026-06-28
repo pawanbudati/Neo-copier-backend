@@ -57,7 +57,7 @@ export interface TradeOrder {
   orderType: "MARKET" | "LIMIT" | "SL";
   triggerPrice?: number;
   transactionType: "BUY" | "SELL";
-  status: "SUCCESS" | "FAILED" | "PENDING";
+  status: "SUCCESS" | "FAILED" | "PENDING" | "CANCELLED";
   errorMessage: string | null;
   timestamp: string;
   isSimulated: boolean;
@@ -187,6 +187,20 @@ export async function saveOrder(order: TradeOrder): Promise<void> {
       errorMessage: order.errorMessage,
       timestamp: order.timestamp,
       isSimulated: order.isSimulated,
+    },
+  });
+}
+
+export async function updateOrderStatus(
+  orderId: string,
+  status: TradeOrder["status"],
+  errorMessage?: string | null
+): Promise<void> {
+  await prisma.order.update({
+    where: { id: orderId },
+    data: {
+      status,
+      ...(errorMessage !== undefined ? { errorMessage } : {}),
     },
   });
 }
