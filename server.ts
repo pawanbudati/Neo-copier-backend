@@ -1,5 +1,6 @@
-
 import "dotenv/config";
+import { initializeLogger, readLastLogLines, clearLogFile } from "./server/logger";
+initializeLogger();
 import express from "express";
 import cors from "cors";
 import path from "path";
@@ -37,6 +38,40 @@ async function startServer() {
   app.use(express.json());
 
   // --- API ROUTES ---
+
+  // Get backend logs
+  app.get("/api/logs", (req, res) => {
+    try {
+      const maxLines = req.query.lines ? Number(req.query.lines) : 500;
+      res.json({ logs: readLastLogLines(maxLines) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Download raw backend logs file
+  app.get("/api/logs/download", (req, res) => {
+    try {
+      const logPath = path.resolve(process.cwd(), "data", "app.log");
+      if (fs.existsSync(logPath)) {
+        res.download(logPath, "app.log");
+      } else {
+        res.status(404).json({ error: "Log file not found" });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Clear/Truncate backend logs
+  app.post("/api/logs/clear", (req, res) => {
+    try {
+      clearLogFile();
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
 
   // Get active settings
   app.get("/api/settings", async (req, res) => {
