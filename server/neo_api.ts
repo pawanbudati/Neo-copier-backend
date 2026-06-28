@@ -1,5 +1,7 @@
 import fs from "fs";
 import path from "path";
+import { spawn, ChildProcess } from "child_process";
+import readline from "readline";
 import { KotakAccount, TradeOrder, saveAccount, saveOrder, updateOrderStatus, getAccounts, getSettings, prisma } from "./db";
 import { generateTOTP } from "./totp";
 
@@ -427,6 +429,10 @@ async function loadScripMaster(): Promise<void> {
         scripMasterLoaded = true;
         console.log(`[ScripMaster] Loaded ${scripMasterCount} raw scrip records from local files to database.`);
         return;
+      }
+
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("Downloading scrip master files from the internet is disabled in the production environment. Please upload and use local cache files.");
       }
 
       const accounts = await getAccounts();
@@ -1433,13 +1439,11 @@ function getExchangeForInstrument(instrument: string): string {
   return "NSE";
 }
 
-// ─── Live Market Feed (REST Polling) ────────────────────────────────────────
-// The Kotak HSM WebSocket (wss://mlhsm.kotaksecurities.com) uses a proprietary
-// BINARY protocol that requires a custom encoder/decoder (see official SDK
-// HSWebSocketLib.py). Instead of reimplementing that complex binary protocol,
-// we poll the REST quotes API every ~1.5 seconds for all subscribed tokens.
-// The same public API (subscribeTokens, onPriceTick, etc.) is preserved so the
-// SSE layer in server.ts works unchanged.
+// ─── Live Market Feed (Python WebSocket Sidecar) ────────────────────────────
+// The Kotak HSM WebSocket uses a proprietary BINARY protocol. To avoid
+// implementing this protocol in Node.js, we spawn a Python sidecar process
+// running the official Kotak Neo SDK to connect to the WebSocket and stream
+// the ticks back to this server.
 
 type PriceCallback = (tick: QuoteTick) => void;
 
@@ -1447,12 +1451,10 @@ let subscribedTokens = new Set<string>();
 const subscriptionCounts = new Map<string, number>();
 const priceListeners: Set<PriceCallback> = new Set();
 let lastPrices: Record<string, QuoteTick> = {};
-let pollTimer: ReturnType<typeof setInterval> | null = null;
-let pollRunning = false;
 let feedConnected = false;
 
-const POLL_INTERVAL_MS = 1500; // Poll every 1.5 seconds
-const MAX_TOKENS_PER_REQUEST = 25; // Kotak limits URL length
+let pythonFeedProcess: ChildProcess | null = null;
+let pythonFeedConnected = false;
 
 function mapToNeoExchange(exchange: string): string {
   switch (exchange.toUpperCase()) {
@@ -1466,211 +1468,233 @@ function mapToNeoExchange(exchange: string): string {
   }
 }
 
-function buildQuoteKeyForToken(scriptToken: string, scrip?: ScripInfo | null): string | null {
-  if (scriptToken === "Nifty 50") return "nse_cm|Nifty 50";
-  if (scriptToken === "SENSEX") return "bse_cm|SENSEX";
+async function formatTokensForPython(tokens: string[]): Promise<any[]> {
+  const dbScrips = await prisma.scrip.findMany({
+    where: {
+      scriptToken: { in: tokens }
+    }
+  });
 
-  if (!scrip) return null;
-  const exchangeSeg = mapToNeoExchange(scrip.exchange);
-  return `${exchangeSeg}|${scrip.scriptToken}`;
+  const formatted: any[] = [];
+  for (const token of tokens) {
+    if (token === "Nifty 50") {
+      formatted.push({ instrument_token: "26000", exchange_segment: "nse_cm" });
+      continue;
+    }
+    if (token === "SENSEX") {
+      formatted.push({ instrument_token: "1", exchange_segment: "bse_cm" });
+      continue;
+    }
+    const scrip = dbScrips.find(s => s.scriptToken === token);
+    if (scrip) {
+      formatted.push({
+        instrument_token: scrip.scriptToken,
+        exchange_segment: mapToNeoExchange(scrip.exchange)
+      });
+    }
+  }
+  return formatted;
 }
 
-async function pollQuotesOnce(): Promise<void> {
-  if (pollRunning) return;
-  if (subscribedTokens.size === 0) return;
+async function sendPythonCommand(action: "subscribe" | "unsubscribe", tokens: string[]) {
+  if (!pythonFeedProcess || !pythonFeedProcess.stdin) return;
+  const formatted = await formatTokensForPython(tokens);
+  if (formatted.length === 0) return;
 
-  const accounts = await getAccounts();
-  const activeAcc = accounts.find((a) => a.status === "active" && a.consumerKey && a.sid && a.neoToken);
-  if (!activeAcc || !activeAcc.neoToken) {
-    feedConnected = false;
-    return;
-  }
-
-  pollRunning = true;
-
+  const cmd = { action, tokens: formatted };
   try {
-    const allTokens = Array.from(subscribedTokens);
-
-    // Build scrip lookup for response mapping
-    const tokenToScrip = new Map<string, ScripInfo>();
-    const dbScrips = await prisma.scrip.findMany({
-      where: {
-        scriptToken: { in: allTokens }
-      }
-    });
-    for (const scrip of dbScrips) {
-      tokenToScrip.set(scrip.scriptToken, scrip as unknown as ScripInfo);
-    }
-
-    // Chunk into batches to avoid URL length limits
-    for (let i = 0; i < allTokens.length; i += MAX_TOKENS_PER_REQUEST) {
-      const chunk = allTokens.slice(i, i + MAX_TOKENS_PER_REQUEST);
-
-      // Build query: exchange_segment|token for each scrip
-      const queryParts: string[] = [];
-      const orderedTokens: string[] = [];
-
-      for (const t of chunk) {
-        const scrip = tokenToScrip.get(t);
-        const key = buildQuoteKeyForToken(t, scrip);
-        if (key) {
-          queryParts.push(key);
-          orderedTokens.push(t);
-        }
-      }
-
-      if (queryParts.length === 0) continue;
-
-      const urlBase = activeAcc.baseUrl || NEO_API_BASE;
-      const quotesPath = queryParts.map(encodeURIComponent).join(",");
-      const url = `${urlBase}/script-details/1.0/quotes/neosymbol/${quotesPath}/ltp`;
-
-      try {
-        const response = await fetch(url, {
-          method: "GET",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": activeAcc.consumerKey,
-            "Sid": activeAcc.sid || "",
-            "Neo-Fin-Key": NEO_FIN_KEY,
-          },
-        });
-
-        if (!response.ok) {
-          const errText = await response.text();
-          console.warn(`[LiveFeed] Quote poll failed (${response.status}):`, errText.slice(0, 200));
-          feedConnected = false;
-          continue;
-        }
-
-        feedConnected = true;
-        const data = await response.json() as any;
-
-        // The API returns an array of quote objects matching the requested order
-        const quoteArray = Array.isArray(data) ? data : (data?.data ? (Array.isArray(data.data) ? data.data : [data.data]) : [data]);
-
-        for (let qi = 0; qi < quoteArray.length; qi++) {
-          const quote = quoteArray[qi];
-          if (!quote) continue;
-
-          // Try to match by position (API returns in same order as request)
-          const scriptToken = orderedTokens[qi];
-          if (!scriptToken) continue;
-
-          const ltp = Number(quote.ltp ?? quote.lp ?? quote.last_price ?? quote.lastTradedPrice ?? 0);
-          if (!Number.isFinite(ltp)) continue;
-
-          const prevClose = Number(quote.c ?? quote.close ?? quote.ohlc?.close ?? 0);
-          const rawChange = Number(quote.cng ?? quote.change ?? quote.changeAmount ?? 0);
-          const rawChangePct = Number(quote.nc ?? quote.per_change ?? quote.perChange ?? quote.changePct ?? 0);
-
-          let change = Number.isFinite(rawChange) ? rawChange : 0;
-          let changePct = Number.isFinite(rawChangePct) ? rawChangePct : 0;
-
-          // Derive change from prevClose if not provided
-          if (change === 0 && prevClose > 0) {
-            change = Math.round((ltp - prevClose) * 100) / 100;
-            changePct = Math.round(((ltp - prevClose) / prevClose) * 10000) / 100;
-          }
-
-          const quoteTick: QuoteTick = {
-            token: scriptToken,
-            ltp,
-            change,
-            changePct,
-            open: Number(quote.op ?? quote.open ?? quote.ohlc?.open ?? 0) || undefined,
-            high: Number(quote.h ?? quote.high ?? quote.ohlc?.high ?? 0) || undefined,
-            low: Number(quote.lo ?? quote.low ?? quote.ohlc?.low ?? 0) || undefined,
-            close: prevClose || undefined,
-            volume: Number(quote.v ?? quote.volume ?? quote.last_volume ?? 0) || undefined,
-          };
-
-          // Only emit if price actually changed
-          const prev = lastPrices[scriptToken];
-          if (!prev || prev.ltp !== quoteTick.ltp || prev.change !== quoteTick.change) {
-            lastPrices[scriptToken] = quoteTick;
-            for (const cb of priceListeners) {
-              try { cb(quoteTick); } catch (_) {}
-            }
-          } else {
-            // Even if unchanged, update the cache
-            lastPrices[scriptToken] = quoteTick;
-          }
-        }
-      } catch (err: any) {
-        console.warn("[LiveFeed] Fetch error:", err?.message || err);
-      }
-    }
-  } finally {
-    pollRunning = false;
+    pythonFeedProcess.stdin.write(JSON.stringify(cmd) + "\n");
+  } catch (err) {
+    console.error("[LiveFeed] Error writing command to Python sidecar stdin:", err);
   }
 }
 
-function startPolling(): void {
-  if (pollTimer) return;
-  console.log(`[LiveFeed] Starting REST quote polling (${POLL_INTERVAL_MS}ms interval)...`);
-  // Run immediately, then every POLL_INTERVAL_MS
-  pollQuotesOnce();
-  pollTimer = setInterval(pollQuotesOnce, POLL_INTERVAL_MS);
-}
+function handlePythonTick(quote: any) {
+  const scriptToken = quote.tk || quote.token || quote.instrument_token;
+  if (!scriptToken) return;
 
-function stopPolling(): void {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-    feedConnected = false;
-    console.log("[LiveFeed] Stopped REST quote polling.");
+  const ltp = Number(quote.ltp ?? quote.lp ?? quote.last_price ?? quote.lastTradedPrice ?? 0);
+  if (!Number.isFinite(ltp)) return;
+
+  const prevClose = Number(quote.c ?? quote.close ?? quote.ohlc?.close ?? 0);
+  const rawChange = Number(quote.cng ?? quote.change ?? quote.changeAmount ?? 0);
+  const rawChangePct = Number(quote.nc ?? quote.per_change ?? quote.perChange ?? quote.changePct ?? 0);
+
+  let change = Number.isFinite(rawChange) ? rawChange : 0;
+  let changePct = Number.isFinite(rawChangePct) ? rawChangePct : 0;
+
+  if (change === 0 && prevClose > 0) {
+    change = Math.round((ltp - prevClose) * 100) / 100;
+    changePct = Math.round(((ltp - prevClose) / prevClose) * 10000) / 100;
+  }
+
+  const quoteTick: QuoteTick = {
+    token: scriptToken,
+    ltp,
+    change,
+    changePct,
+    open: Number(quote.op ?? quote.open ?? quote.ohlc?.open ?? 0) || undefined,
+    high: Number(quote.h ?? quote.high ?? quote.ohlc?.high ?? 0) || undefined,
+    low: Number(quote.lo ?? quote.low ?? quote.ohlc?.low ?? 0) || undefined,
+    close: prevClose || undefined,
+    volume: Number(quote.v ?? quote.volume ?? quote.last_volume ?? 0) || undefined,
+  };
+
+  const prev = lastPrices[scriptToken];
+  if (!prev || prev.ltp !== quoteTick.ltp || prev.change !== quoteTick.change) {
+    lastPrices[scriptToken] = quoteTick;
+    for (const cb of priceListeners) {
+      try { cb(quoteTick); } catch (_) {}
+    }
+  } else {
+    lastPrices[scriptToken] = quoteTick;
   }
 }
 
 export async function connectMarketFeed(): Promise<void> {
-  if (pollTimer) return; // Already running
+  if (pythonFeedProcess) return; // Already running
+
   const accounts = await getAccounts();
   const activeAcc = accounts.find((a) => a.status === "active" && a.consumerKey && a.sid && a.neoToken);
   if (!activeAcc) {
     console.warn("[LiveFeed] No active session for market feed.");
     return;
   }
-  startPolling();
+
+  console.log("[LiveFeed] Spawning Python sidecar WebSocket helper...");
+
+  const pythonCmd = process.platform === "win32" ? "python" : "python3";
+  const helperPath = path.resolve(__dirname, "feed_helper.py");
+
+  pythonFeedProcess = spawn(pythonCmd, [
+    helperPath,
+    "--consumer-key", activeAcc.consumerKey,
+    "--mobile", activeAcc.mobileNumber,
+    "--ucc", activeAcc.ucc,
+    "--mpin", activeAcc.mpin,
+    "--totp-secret", activeAcc.totpSecret || ""
+  ]);
+
+  pythonFeedConnected = false;
+
+  if (pythonFeedProcess.stdout) {
+    const rl = readline.createInterface({
+      input: pythonFeedProcess.stdout,
+      terminal: false
+    });
+
+    rl.on("line", (line) => {
+      try {
+        const msg = JSON.parse(line);
+        if (!msg) return;
+
+        if (msg.type === "tick") {
+          handlePythonTick(msg.data);
+        } else if (msg.type === "connected") {
+          console.log("[LiveFeed] Python sidecar connected to Kotak WebSocket.");
+          pythonFeedConnected = true;
+          feedConnected = true;
+
+          // Subscribe to all currently requested tokens
+          if (subscribedTokens.size > 0) {
+            sendPythonCommand("subscribe", Array.from(subscribedTokens));
+          }
+        } else if (msg.type === "error") {
+          console.error("[LiveFeed] Python sidecar WebSocket error:", msg.message);
+        } else if (msg.type === "closed") {
+          console.warn("[LiveFeed] Python sidecar WebSocket connection closed.");
+          pythonFeedConnected = false;
+          feedConnected = false;
+        }
+      } catch (err) {
+        console.error("[LiveFeed] Error parsing line from Python sidecar stdout:", err);
+      }
+    });
+  }
+
+  if (pythonFeedProcess.stderr) {
+    const rlErr = readline.createInterface({
+      input: pythonFeedProcess.stderr,
+      terminal: false
+    });
+    rlErr.on("line", (line) => {
+      console.log(`${line}`);
+    });
+  }
+
+  pythonFeedProcess.on("close", (code) => {
+    console.log(`[LiveFeed] Python sidecar process exited with code ${code}`);
+    pythonFeedProcess = null;
+    pythonFeedConnected = false;
+    feedConnected = false;
+
+    // Auto-reconnect after 5 seconds if we still have subscriptions
+    if (subscribedTokens.size > 0) {
+      console.log("[LiveFeed] Subscribed tokens exist. Reconnecting Python sidecar in 5 seconds...");
+      setTimeout(() => {
+        if (subscribedTokens.size > 0 && !pythonFeedProcess) {
+          connectMarketFeed();
+        }
+      }, 5000);
+    }
+  });
+
+  pythonFeedProcess.on("error", (err) => {
+    console.error("[LiveFeed] Failed to start Python sidecar process:", err);
+    pythonFeedProcess = null;
+    pythonFeedConnected = false;
+    feedConnected = false;
+  });
+}
+
+function stopPolling(): void {
+  if (pythonFeedProcess) {
+    console.log("[LiveFeed] Stopping Python sidecar WebSocket helper...");
+    pythonFeedProcess.kill("SIGTERM");
+    pythonFeedProcess = null;
+    pythonFeedConnected = false;
+    feedConnected = false;
+  }
 }
 
 export function subscribeTokens(tokens: string[]): void {
   const requestedTokens = tokens.filter(Boolean);
-  let hasNew = false;
+  let newlyAdded: string[] = [];
 
   for (const token of requestedTokens) {
     const count = subscriptionCounts.get(token) || 0;
     subscriptionCounts.set(token, count + 1);
     if (!subscribedTokens.has(token)) {
       subscribedTokens.add(token);
-      hasNew = true;
+      newlyAdded.push(token);
     }
   }
 
-  // Start polling if not already running and we have tokens
-  if (subscribedTokens.size > 0 && !pollTimer) {
+  if (subscribedTokens.size > 0 && !pythonFeedProcess) {
     connectMarketFeed();
-  }
-
-  // Immediately poll for new tokens so the user doesn't wait 1.5s
-  if (hasNew) {
-    pollQuotesOnce();
+  } else if (newlyAdded.length > 0 && pythonFeedConnected) {
+    sendPythonCommand("subscribe", newlyAdded);
   }
 }
 
 export function unsubscribeTokens(tokens: string[]): void {
+  const removed: string[] = [];
   for (const token of tokens.filter(Boolean)) {
     const count = subscriptionCounts.get(token) || 0;
     if (count <= 1) {
       subscriptionCounts.delete(token);
       subscribedTokens.delete(token);
+      removed.push(token);
     } else {
       subscriptionCounts.set(token, count - 1);
     }
   }
 
-  // Stop polling if no more tokens
-  if (subscribedTokens.size === 0) {
+  if (removed.length > 0 && pythonFeedConnected) {
+    sendPythonCommand("unsubscribe", removed);
+  }
+
+  if (subscribedTokens.size === 0 && pythonFeedProcess) {
     stopPolling();
   }
 }
@@ -1685,5 +1709,5 @@ export function getLastPrices(): Record<string, QuoteTick> {
 }
 
 export function isMarketFeedConnected(): boolean {
-  return feedConnected || (pollTimer !== null && subscribedTokens.size > 0);
+  return feedConnected || (pythonFeedProcess !== null && subscribedTokens.size > 0);
 }
