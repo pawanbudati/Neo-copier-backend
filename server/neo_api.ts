@@ -1527,7 +1527,7 @@ async function pollQuotesOnce(): Promise<void> {
 
       const urlBase = activeAcc.baseUrl || NEO_API_BASE;
       const quotesPath = queryParts.map(encodeURIComponent).join(",");
-      const url = `${urlBase}/script-details/1.0/quotes/neosymbol/${quotesPath}/ltp`;
+      const url = `${urlBase}/script-details/1.0/quotes/neosymbol/${quotesPath}`;
 
       try {
         const response = await fetch(url, {
