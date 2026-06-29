@@ -7,7 +7,7 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import { getAccounts, saveAccount, deleteAccount, getOrders, saveOrder, updateOrderStatus, getSettings, updateSettings, KotakAccount, WatchlistItem, initializeDbForCloud } from "./server/db";
-import { authenticateKotakAccount, replicateMasterTrade, searchScrips, loadScripMasterCache, isScripMasterLoaded, getScripMasterCount, ScripInfo, subscribeTokens, unsubscribeTokens, onPriceTick, getLastPrices, isMarketFeedConnected, connectMarketFeed, QuoteTick, getNeoAccountPositions, getNeoAccountLimits, executeNeoOrder, cancelNeoOrder, getOrderLiveStatus, initializeScripStatusFromDb } from "./server/neo_api";
+import { authenticateKotakAccount, replicateMasterTrade, searchScrips, loadScripMasterCache, isScripMasterLoaded, getScripMasterCount, ScripInfo, subscribeTokens, unsubscribeTokens, onPriceTick, getLastPrices, isMarketFeedConnected, connectMarketFeed, QuoteTick, getNeoAccountPositions, getNeoAccountLimits, executeNeoOrder, cancelNeoOrder, getOrderLiveStatus, initializeScripStatusFromDb, getSystemPower, setSystemPower } from "./server/neo_api";
 import { generateTOTP } from "./server/totp";
 
 function hasAutoTotpSecret(secret?: string): boolean {
@@ -87,6 +87,26 @@ async function startServer() {
     try {
       const newSettings = await updateSettings(req.body);
       res.json(newSettings);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Get system power status
+  app.get("/api/system/power", (req, res) => {
+    res.json({ powerOn: getSystemPower() });
+  });
+
+  // Update system power status
+  app.post("/api/system/power", (req, res) => {
+    try {
+      const { powerOn } = req.body;
+      if (typeof powerOn !== "boolean") {
+        res.status(400).json({ error: "powerOn must be a boolean" });
+        return;
+      }
+      setSystemPower(powerOn);
+      res.json({ success: true, powerOn: getSystemPower() });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

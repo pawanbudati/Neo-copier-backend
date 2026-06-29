@@ -1455,6 +1455,23 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
 let pollRunning = false;
 let feedConnected = false;
 
+let isSystemPowerOn = true;
+
+export function getSystemPower(): boolean {
+  return isSystemPowerOn;
+}
+
+export function setSystemPower(powerOn: boolean): void {
+  isSystemPowerOn = powerOn;
+  if (!powerOn) {
+    stopPolling();
+  } else {
+    if (subscribedTokens.size > 0) {
+      connectMarketFeed();
+    }
+  }
+}
+
 const POLL_INTERVAL_MS = 500; // Poll every 500ms
 const MAX_TOKENS_PER_REQUEST = 25; // Kotak limits URL length
 
@@ -1611,6 +1628,7 @@ async function pollQuotesOnce(): Promise<void> {
 }
 
 function startPolling(): void {
+  if (!isSystemPowerOn) return;
   if (pollTimer) return;
   console.log(`[LiveFeed] Starting REST quote polling (${POLL_INTERVAL_MS}ms interval)...`);
   // Run immediately, then every POLL_INTERVAL_MS
@@ -1628,6 +1646,7 @@ function stopPolling(): void {
 }
 
 export async function connectMarketFeed(): Promise<void> {
+  if (!isSystemPowerOn) return;
   if (pollTimer) return; // Already running
   const accounts = await getAccounts();
   const activeAcc = accounts.find((a) => a.status === "active" && a.consumerKey && a.sid && a.neoToken);
